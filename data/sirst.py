@@ -1,381 +1,628 @@
-import torch
+"""
+Infrared Small Target Detection (IRSTD) Dataset Modules.
 
-import torch.utils.data as Data
-import torchvision.transforms as transforms
+This module provides dataset classes for loading and preprocessing
+infrared small target detection datasets including IRSTD-1k, NUDT-SIRST,
+MDFA, and SIRST.
+"""
 
-import cv2
 import os
 import os.path as osp
 import shutil
-import re
 from pathlib import Path
+from typing import List, Optional, Tuple, Union
 
-from data.utils import RandomResize, Augment_transform, mask2point
+import cv2
+import torch
+import torch.utils.data as Data
+import torchvision.transforms as transforms
+
+from data.utils import Augment_transform, mask2point
+
+# Constants
+DEFAULT_BASE_SIZE = 256
+DEFAULT_OFFSET = 0
+PIXEL_NORMALIZATION_FACTOR = 255.0
 
 
-__all__ = ["SirstAugDataset", "IRSTD1kDataset", "NUDTDataset"]
+__all__ = [
+    "SIRSTDataset",
+    "IRSTD1kDataset",
+    "NUDTDataset",
+    "MDFADataset",
+]
 
 
 class IRSTD1kDataset(Data.Dataset):
-    """
-    Return: Single channel
+    """IRSTD-1k dataset for infrared small target detection.
+
+    This dataset loads single-channel infrared images and their corresponding
+    masks. Supports pseudo-labels, predicted labels, and point label generation.
+
+    Attributes:
+        data_dir (str): Path to the dataset directory (trainval or test).
+        mode (str): Dataset mode, either 'train' or 'test'.
+        base_size (int): Base size for image resizing.
+        pt_label (bool): Whether to generate point labels from masks.
+        offset (int): Offset for point label generation.
+        pseudo_label (bool): Whether to load pseudo labels.
+        preded_label (bool): Whether to load predicted labels.
+        augment (bool): Whether to apply data augmentation.
+        turn_num (str): Turn number for pseudo/predicted label subdirectories.
+        target_mix (bool): Whether to apply target mixing (currently unused).
+        names (List[str]): List of image filenames.
+        aug_transformer: Augmentation transformer instance.
     """
 
     def __init__(
         self,
-        base_dir=r"W:/DataSets/Infraid_datasets/IRSTD-1k",
-        mode="train",
-        base_size=256,
-        pt_label=False,
-        offset = 0,
-        pseudo_label=False,
-        preded_label=False,
-        augment=True,
-        turn_num='',
-        target_mix = False,
-        file_name = ''
-    ):
-        assert mode in ["train", "test"]
+        base_dir: str = r"W:/DataSets/Infraid_datasets/IRSTD-1k",
+        mode: str = "train",
+        base_size: int = DEFAULT_BASE_SIZE,
+        pt_label: bool = False,
+        offset: int = DEFAULT_OFFSET,
+        pseudo_label: bool = False,
+        preded_label: bool = False,
+        augment: bool = True,
+        turn_num: str = "",
+        target_mix: bool = False,
+        file_name: str = "",
+    ) -> None:
+        """Initialize the IRSTD-1k dataset.
 
-        if mode == "train":
-            self.data_dir = osp.join(base_dir, "trainval")
-        elif mode == "test":
-            self.data_dir = osp.join(base_dir, "test")
-        else:
-            raise NotImplementedError
-        
+        Args:
+            base_dir: Root directory of the dataset.
+            mode: Dataset mode ('train' or 'test').
+            base_size: Base size for image resizing.
+            pt_label: Whether to generate point labels from masks.
+            offset: Offset for point label generation.
+            pseudo_label: Whether to load pseudo labels.
+            preded_label: Whether to load predicted labels.
+            augment: Whether to apply data augmentation.
+            turn_num: Turn number for pseudo/predicted label subdirectories.
+            target_mix: Whether to apply target mixing (currently unused).
+            file_name: Subdirectory suffix for images folder.
+        """
+        assert mode in ["train", "test"], f"Mode must be 'train' or 'test', got '{mode}'"
+
+        # Set data directory based on mode
+        split_dir = "trainval" if mode == "train" else "test"
+        self.data_dir = osp.join(base_dir, split_dir)
+
+        # Store configuration
         self.mode = mode
         self.base_size = base_size
         self.pt_label = pt_label
         self.offset = offset
-        self.pesudo_label = pseudo_label
+        self.pseudo_label = pseudo_label  # Fixed typo: was 'pesudo_label'
         self.preded_label = preded_label
-        self.aug = augment
+        self.augment = augment  # Fixed: was 'aug'
         self.turn_num = turn_num
         self.target_mix = target_mix
-        self.names = []
-        for filename in os.listdir(osp.join(self.data_dir, 'images' + file_name)):
-            if filename.endswith("png"):
+
+        # Load image filenames
+        self.names: List[str] = []
+        images_dir = osp.join(self.data_dir, f"images{file_name}")
+        for filename in os.listdir(images_dir):
+            if filename.endswith(".png"):
                 self.names.append(filename)
 
-        self.aug_transformer = Augment_transform(base_size, mode) if augment else Augment_transform(base_size, "test")
-        # self.gaussian_blur = transforms.GaussianBlur(kernel_size=5, sigma=(0.8, 1.0)) if target_mix else None
-        # self.target_trans = transforms.Compose([
-        #     transforms.RandomAffine(degrees=180, translate=(0.3, 0.3)),
-        #     transforms.RandomHorizontalFlip()])  # 随机水平翻转
-        # self.gaussian_filter3 = transforms.GaussianBlur(kernel_size=3, sigma=(0.3, 0.5)) if target_mix else None
-        # self.gaussian_filter9 = transforms.GaussianBlur(kernel_size=9, sigma=(0.3, 0.5)) if target_mix else None
+        # Initialize augmentation transformer
+        aug_mode = mode if augment else "test"
+        self.aug_transformer = Augment_transform(base_size, aug_mode)
 
-    def __getitem__(self, i):
-        name = self.names[i]
+    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Get a sample from the dataset.
+
+        Args:
+            index: Index of the sample to retrieve.
+
+        Returns:
+            A tuple of (image, mask) tensors. Image is single channel [1, H, W].
+            Mask may contain multiple channels if pseudo/predicted labels are loaded.
+        """
+        name = self.names[index]
         img_path = osp.join(self.data_dir, "images", name)
-        pesudo_label_path = osp.join(self.data_dir, f'pixel_pseudo_label{self.turn_num}_', name)
-        preded_label_path = osp.join(self.data_dir, f'preded_label/{self.turn_num}', name)
+        pseudo_label_path = osp.join(
+            self.data_dir, f"pixel_pseudo_label{self.turn_num}_", name
+        )
+        preded_label_path = osp.join(
+            self.data_dir, f"preded_label/{self.turn_num}", name
+        )
         label_path = osp.join(self.data_dir, "masks", name)
 
-        img, mask= cv2.imread(img_path, 0), cv2.imread(label_path, 0)
-        img, mask= torch.from_numpy(img).unsqueeze(0).float(), torch.from_numpy(mask).unsqueeze(0).float()
-        
-        if self.pesudo_label:
-            pesudo_label = cv2.imread(pesudo_label_path, 0)
-            pesudo_label = torch.from_numpy(pesudo_label).unsqueeze(0).float()
-            mask = torch.cat([mask, pesudo_label], dim=0)
+        # Load image and mask as single-channel tensors
+        img_np = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+        mask_np = cv2.imread(label_path, cv2.IMREAD_GRAYSCALE)
+        img = torch.from_numpy(img_np).unsqueeze(0).float()
+        mask = torch.from_numpy(mask_np).unsqueeze(0).float()
+
+        # Load pseudo label if enabled
+        if self.pseudo_label:
+            pseudo_label_np = cv2.imread(pseudo_label_path, cv2.IMREAD_GRAYSCALE)
+            pseudo_label = torch.from_numpy(pseudo_label_np).unsqueeze(0).float()
+            mask = torch.cat([mask, pseudo_label], dim=0)
+
+        # Load predicted label if enabled
         if self.preded_label:
-            preded_label = cv2.imread(preded_label_path, 0)
-            preded_label = torch.from_numpy(preded_label).unsqueeze(0).float()
+            preded_label_np = cv2.imread(preded_label_path, cv2.IMREAD_GRAYSCALE)
+            preded_label = torch.from_numpy(preded_label_np).unsqueeze(0).float()
             mask = torch.cat([mask, preded_label], dim=0)
-        
+
+        # Apply augmentation
         img, mask = self.aug_transformer(img, mask)
 
-        img, mask = img / 255.0, mask / 255.0
+        # Normalize to [0, 1]
+        img = img / PIXEL_NORMALIZATION_FACTOR
+        mask = mask / PIXEL_NORMALIZATION_FACTOR
 
+        # Convert mask to point label if enabled
         if self.pt_label:
             pt_label = mask2point(mask[0].unsqueeze(0), img, self.offset)
             mask[0] = pt_label
 
         return img, mask
 
-    def __len__(self):
+    def __len__(self) -> int:
+        """Return the number of samples in the dataset."""
         return len(self.names)
 
 
 class NUDTDataset(Data.Dataset):
+    """NUDT-SIRST dataset for infrared small target detection.
+
+    This dataset loads single-channel infrared images and their corresponding
+    masks. Supports pseudo-labels, predicted labels, and point label generation.
+
+    Attributes:
+        data_dir (str): Path to the dataset directory (trainval or test).
+        mode (str): Dataset mode, either 'train' or 'test'.
+        base_size (int): Base size for image resizing.
+        pt_label (bool): Whether to generate point labels from masks.
+        offset (int): Offset for point label generation.
+        pseudo_label (bool): Whether to load pseudo labels.
+        preded_label (bool): Whether to load predicted labels.
+        augment (bool): Whether to apply data augmentation.
+        turn_num (str): Turn number for pseudo/predicted label subdirectories.
+        target_mix (bool): Whether to apply target mixing (currently unused).
+        names (List[str]): List of image filenames.
+        aug_transformer: Augmentation transformer instance.
     """
-    Return: Single channel
-    """
+
     def __init__(
         self,
-        base_dir=r"W:/DataSets/Infraid_datasets/NUDT-SIRST",
-        mode="train",
-        base_size=256,
-        pt_label=False,
-        offset = 0,
-        pseudo_label=False,
-        preded_label=False,
-        augment=True,
-        turn_num='',
-        target_mix = False,
-        file_name = ''
-    ):
-        assert mode in ["train", "test"]
+        base_dir: str = r"W:/DataSets/Infraid_datasets/NUDT-SIRST",
+        mode: str = "train",
+        base_size: int = DEFAULT_BASE_SIZE,
+        pt_label: bool = False,
+        offset: int = DEFAULT_OFFSET,
+        pseudo_label: bool = False,
+        preded_label: bool = False,
+        augment: bool = True,
+        turn_num: str = "",
+        target_mix: bool = False,
+        file_name: str = "",
+    ) -> None:
+        """Initialize the NUDT-SIRST dataset.
 
-        if mode == "train":
-            self.data_dir = osp.join(base_dir, "trainval")
-        elif mode == "test":
-            self.data_dir = osp.join(base_dir, "test")
-        else:
-            raise NotImplementedError
-        self.mode = mode 
+        Args:
+            base_dir: Root directory of the dataset.
+            mode: Dataset mode ('train' or 'test').
+            base_size: Base size for image resizing.
+            pt_label: Whether to generate point labels from masks.
+            offset: Offset for point label generation.
+            pseudo_label: Whether to load pseudo labels.
+            preded_label: Whether to load predicted labels.
+            augment: Whether to apply data augmentation.
+            turn_num: Turn number for pseudo/predicted label subdirectories.
+            target_mix: Whether to apply target mixing (currently unused).
+            file_name: Subdirectory suffix for images folder.
+        """
+        assert mode in ["train", "test"], f"Mode must be 'train' or 'test', got '{mode}'"
+
+        # Set data directory based on mode
+        split_dir = "trainval" if mode == "train" else "test"
+        self.data_dir = osp.join(base_dir, split_dir)
+
+        # Store configuration
+        self.mode = mode
         self.base_size = base_size
         self.pt_label = pt_label
         self.offset = offset
-        self.pesudo_label = pseudo_label
+        self.pseudo_label = pseudo_label  # Fixed typo: was 'pesudo_label'
         self.preded_label = preded_label
-        self.aug = augment
+        self.augment = augment  # Fixed: was 'aug'
         self.turn_num = turn_num
         self.target_mix = target_mix
-        self.names = []
-        for filename in os.listdir(osp.join(self.data_dir, 'images' + file_name)):
-            if filename.endswith("png"):
+
+        # Load image filenames
+        self.names: List[str] = []
+        images_dir = osp.join(self.data_dir, f"images{file_name}")
+        for filename in os.listdir(images_dir):
+            if filename.endswith(".png"):
                 self.names.append(filename)
 
-        self.aug_transformer = Augment_transform(base_size, mode) if augment else Augment_transform(base_size, "test")
-        # self.gaussian_blur = transforms.GaussianBlur(kernel_size=5, sigma=(0.8, 1.0)) if target_mix else None
-        # self.target_trans = transforms.Compose([
-        #     transforms.RandomAffine(degrees=180, translate=(0.3, 0.3)),
-        #     transforms.RandomHorizontalFlip()])  # 随机水平翻转
-        # self.gaussian_filter3 = transforms.GaussianBlur(kernel_size=3, sigma=(0.3, 0.5)) if target_mix else None
-        # self.gaussian_filter9 = transforms.GaussianBlur(kernel_size=9, sigma=(0.3, 0.5)) if target_mix else None
+        # Initialize augmentation transformer
+        aug_mode = mode if augment else "test"
+        self.aug_transformer = Augment_transform(base_size, aug_mode)
 
-    def __getitem__(self, i):
-        name = self.names[i]
+    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Get a sample from the dataset.
+
+        Args:
+            index: Index of the sample to retrieve.
+
+        Returns:
+            A tuple of (image, mask) tensors. Image is single channel [1, H, W].
+            Mask may contain multiple channels if pseudo/predicted labels are loaded.
+        """
+        name = self.names[index]
         img_path = osp.join(self.data_dir, "images", name)
-        pesudo_label_path = osp.join(self.data_dir, f'pixel_pseudo_label{self.turn_num}_', name)
-        # pesudo_label_path = osp.join(self.data_dir, "masks", name)
-        preded_label_path = osp.join(self.data_dir, f'preded_label/{self.turn_num}', name)
+        pseudo_label_path = osp.join(
+            self.data_dir, f"pixel_pseudo_label{self.turn_num}_", name
+        )
+        preded_label_path = osp.join(
+            self.data_dir, f"preded_label/{self.turn_num}", name
+        )
         label_path = osp.join(self.data_dir, "masks", name)
 
-        img, mask= cv2.imread(img_path, 0), cv2.imread(label_path, 0)
-        img, mask= torch.from_numpy(img).unsqueeze(0).float(), torch.from_numpy(mask).unsqueeze(0).float()
-        
-        if self.pesudo_label:
-            pesudo_label = cv2.imread(pesudo_label_path, 0)
-            pesudo_label = torch.from_numpy(pesudo_label).unsqueeze(0).float()
-            mask = torch.cat([mask, pesudo_label], dim=0)
+        # Load image and mask as single-channel tensors
+        img_np = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+        mask_np = cv2.imread(label_path, cv2.IMREAD_GRAYSCALE)
+        img = torch.from_numpy(img_np).unsqueeze(0).float()
+        mask = torch.from_numpy(mask_np).unsqueeze(0).float()
+
+        # Load pseudo label if enabled
+        if self.pseudo_label:
+            pseudo_label_np = cv2.imread(pseudo_label_path, cv2.IMREAD_GRAYSCALE)
+            pseudo_label = torch.from_numpy(pseudo_label_np).unsqueeze(0).float()
+            mask = torch.cat([mask, pseudo_label], dim=0)
+
+        # Load predicted label if enabled
         if self.preded_label:
-            preded_label = cv2.imread(preded_label_path, 0)
-            preded_label = torch.from_numpy(preded_label).unsqueeze(0).float()
+            preded_label_np = cv2.imread(preded_label_path, cv2.IMREAD_GRAYSCALE)
+            preded_label = torch.from_numpy(preded_label_np).unsqueeze(0).float()
             mask = torch.cat([mask, preded_label], dim=0)
-        
+
+        # Apply augmentation
         img, mask = self.aug_transformer(img, mask)
 
-        img, mask = img / 255.0, mask / 255.0
+        # Normalize to [0, 1]
+        img = img / PIXEL_NORMALIZATION_FACTOR
+        mask = mask / PIXEL_NORMALIZATION_FACTOR
 
+        # Convert mask to point label if enabled
         if self.pt_label:
             pt_label = mask2point(mask[0].unsqueeze(0), img, self.offset)
             mask[0] = pt_label
 
         return img, mask
-    
-    def __len__(self):
+
+    def __len__(self) -> int:
+        """Return the number of samples in the dataset."""
         return len(self.names)
     
 
 class MDFADataset(Data.Dataset):
-    '''
-    Return: Single channel
-    '''
+    """MDFA dataset for infrared small target detection.
+
+    This dataset loads single-channel infrared images and their corresponding
+    masks. Supports pseudo-labels, predicted labels, and point label generation.
+    Note: Pseudo labels are resized to match mask dimensions if needed.
+
+    Attributes:
+        data_dir (str): Path to the dataset directory (trainval or test).
+        mode (str): Dataset mode, either 'train' or 'test'.
+        base_size (int): Base size for image resizing.
+        pt_label (bool): Whether to generate point labels from masks.
+        offset (int): Offset for point label generation.
+        pseudo_label (bool): Whether to load pseudo labels.
+        preded_label (bool): Whether to load predicted labels.
+        augment (bool): Whether to apply data augmentation.
+        turn_num (str): Turn number for pseudo/predicted label subdirectories.
+        target_mix (bool): Whether to apply target mixing (currently unused).
+        names (List[str]): List of image filenames.
+        aug_transformer: Augmentation transformer instance.
+    """
+
     def __init__(
         self,
-        base_dir=r"W:/DataSets/Infraid_datasets/NUDT-SIRST",
-        mode="train",
-        base_size=256,
-        pt_label=False,
-        offset = 0,
-        pseudo_label=False,
-        preded_label=False,
-        augment=True,
-        turn_num='',
-        target_mix = False,
-        file_name = '',
-    ):
-        assert mode in ["train", "test"]
+        base_dir: str = r"W:/DataSets/Infraid_datasets/MDFA",
+        mode: str = "train",
+        base_size: int = DEFAULT_BASE_SIZE,
+        pt_label: bool = False,
+        offset: int = DEFAULT_OFFSET,
+        pseudo_label: bool = False,
+        preded_label: bool = False,
+        augment: bool = True,
+        turn_num: str = "",
+        target_mix: bool = False,
+        file_name: str = "",
+    ) -> None:
+        """Initialize the MDFA dataset.
 
-        if mode == "train":
-            self.data_dir = osp.join(base_dir, "trainval")
-        elif mode == "test":
-            self.data_dir = osp.join(base_dir, "test")
-        else:
-            raise NotImplementedError
-        self.mode = mode 
+        Args:
+            base_dir: Root directory of the dataset.
+            mode: Dataset mode ('train' or 'test').
+            base_size: Base size for image resizing.
+            pt_label: Whether to generate point labels from masks.
+            offset: Offset for point label generation.
+            pseudo_label: Whether to load pseudo labels.
+            preded_label: Whether to load predicted labels.
+            augment: Whether to apply data augmentation.
+            turn_num: Turn number for pseudo/predicted label subdirectories.
+            target_mix: Whether to apply target mixing (currently unused).
+            file_name: Subdirectory suffix for images folder.
+        """
+        assert mode in ["train", "test"], f"Mode must be 'train' or 'test', got '{mode}'"
+
+        # Set data directory based on mode
+        split_dir = "trainval" if mode == "train" else "test"
+        self.data_dir = osp.join(base_dir, split_dir)
+
+        # Store configuration
+        self.mode = mode
         self.base_size = base_size
         self.pt_label = pt_label
         self.offset = offset
-        self.pesudo_label = pseudo_label
+        self.pseudo_label = pseudo_label  # Fixed typo: was 'pesudo_label'
         self.preded_label = preded_label
-        self.aug = augment
+        self.augment = augment  # Fixed: was 'aug'
         self.turn_num = turn_num
         self.target_mix = target_mix
-        self.names = []
-        for filename in os.listdir(osp.join(self.data_dir, 'images' + file_name)):
-            if filename.endswith('png'):
+
+        # Load image filenames
+        self.names: List[str] = []
+        images_dir = osp.join(self.data_dir, f"images{file_name}")
+        for filename in os.listdir(images_dir):
+            if filename.endswith(".png"):
                 self.names.append(filename)
 
-        self.aug_transformer = Augment_transform(base_size, mode) if augment else Augment_transform(base_size, "test")
+        # Initialize augmentation transformer
+        aug_mode = mode if augment else "test"
+        self.aug_transformer = Augment_transform(base_size, aug_mode)
 
-    def __getitem__(self, i):
-        name = self.names[i]
+    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Get a sample from the dataset.
+
+        Args:
+            index: Index of the sample to retrieve.
+
+        Returns:
+            A tuple of (image, mask) tensors. Image is single channel [1, H, W].
+            Mask may contain multiple channels if pseudo/predicted labels are loaded.
+        """
+        name = self.names[index]
         img_path = osp.join(self.data_dir, "images", name)
-        pesudo_label_path = osp.join(self.data_dir, f'pixel_pseudo_label{self.turn_num}', name)
-        preded_label_path = osp.join(self.data_dir, f'preded_label/{self.turn_num}', name)
+        pseudo_label_path = osp.join(
+            self.data_dir, f"pixel_pseudo_label{self.turn_num}", name
+        )
+        preded_label_path = osp.join(
+            self.data_dir, f"preded_label/{self.turn_num}", name
+        )
         label_path = osp.join(self.data_dir, "masks", name)
 
-        img, mask= cv2.imread(img_path, 0), cv2.imread(label_path, 0)
-        img, mask= torch.from_numpy(img).unsqueeze(0).float(), torch.from_numpy(mask).unsqueeze(0).float()
-        
-        if self.pesudo_label:
-            pesudo_label = cv2.imread(pesudo_label_path, 0)
-            pesudo_label = torch.from_numpy(pesudo_label).unsqueeze(0).float()
-            pesudo_label = transforms.functional.resize(pesudo_label, (mask.shape[-2], mask.shape[-1]))
-            mask = torch.cat([mask, pesudo_label], dim=0)
+        # Load image and mask as single-channel tensors
+        img_np = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+        mask_np = cv2.imread(label_path, cv2.IMREAD_GRAYSCALE)
+        img = torch.from_numpy(img_np).unsqueeze(0).float()
+        mask = torch.from_numpy(mask_np).unsqueeze(0).float()
+
+        # Load and resize pseudo label if enabled
+        if self.pseudo_label:
+            pseudo_label_np = cv2.imread(pseudo_label_path, cv2.IMREAD_GRAYSCALE)
+            pseudo_label = torch.from_numpy(pseudo_label_np).unsqueeze(0).float()
+            # Resize pseudo label to match mask dimensions
+            pseudo_label = transforms.functional.resize(
+                pseudo_label, (mask.shape[-2], mask.shape[-1])
+            )
+            mask = torch.cat([mask, pseudo_label], dim=0)
+
+        # Load predicted label if enabled
         if self.preded_label:
-            preded_label = cv2.imread(preded_label_path, 0)
-            preded_label = torch.from_numpy(preded_label).unsqueeze(0).float()
+            preded_label_np = cv2.imread(preded_label_path, cv2.IMREAD_GRAYSCALE)
+            preded_label = torch.from_numpy(preded_label_np).unsqueeze(0).float()
             mask = torch.cat([mask, preded_label], dim=0)
-        
+
+        # Apply augmentation
         img, mask = self.aug_transformer(img, mask)
 
-        img, mask = img / 255.0, mask / 255.0
+        # Normalize to [0, 1]
+        img = img / PIXEL_NORMALIZATION_FACTOR
+        mask = mask / PIXEL_NORMALIZATION_FACTOR
 
+        # Convert mask to point label if enabled
         if self.pt_label:
             pt_label = mask2point(mask[0].unsqueeze(0), img, self.offset)
             mask[0] = pt_label
 
         return img, mask
-    
-    def __len__(self):
+
+    def __len__(self) -> int:
+        """Return the number of samples in the dataset."""
         return len(self.names)
 
 
 class SIRSTDataset(Data.Dataset):
-    '''
-    Return: Single channel
-    '''
+    """SIRST dataset for infrared small target detection.
+
+    This dataset loads single-channel infrared images and their corresponding
+    masks. Supports pseudo-labels, predicted labels, and point label generation.
+    Note: Pseudo labels are resized to match mask dimensions if needed.
+
+    Attributes:
+        data_dir (str): Path to the dataset directory (trainval or test).
+        mode (str): Dataset mode, either 'train' or 'test'.
+        base_size (int): Base size for image resizing.
+        pt_label (bool): Whether to generate point labels from masks.
+        offset (int): Offset for point label generation.
+        pseudo_label (bool): Whether to load pseudo labels.
+        preded_label (bool): Whether to load predicted labels.
+        augment (bool): Whether to apply data augmentation.
+        turn_num (str): Turn number for pseudo/predicted label subdirectories.
+        target_mix (bool): Whether to apply target mixing (currently unused).
+        names (List[str]): List of image filenames.
+        aug_transformer: Augmentation transformer instance.
+    """
+
     def __init__(
         self,
-        base_dir=r"W:/DataSets/Infraid_datasets/SIRST",
-        mode="train",
-        base_size=256,
-        pt_label=False,
-        offset = 0,
-        pseudo_label=False,
-        preded_label=False,
-        augment=True,
-        turn_num='',
-        target_mix = False,
-        file_name = '',
-    ):
-        assert mode in ["train", "test"]
+        base_dir: str = r"W:/DataSets/Infraid_datasets/SIRST",
+        mode: str = "train",
+        base_size: int = DEFAULT_BASE_SIZE,
+        pt_label: bool = False,
+        offset: int = DEFAULT_OFFSET,
+        pseudo_label: bool = False,
+        preded_label: bool = False,
+        augment: bool = True,
+        turn_num: str = "",
+        target_mix: bool = False,
+        file_name: str = "",
+    ) -> None:
+        """Initialize the SIRST dataset.
 
-        if mode == "train":
-            self.data_dir = osp.join(base_dir, "trainval")
-        elif mode == "test":
-            self.data_dir = osp.join(base_dir, "test")
-        else:
-            raise NotImplementedError
-        self.mode = mode 
+        Args:
+            base_dir: Root directory of the dataset.
+            mode: Dataset mode ('train' or 'test').
+            base_size: Base size for image resizing.
+            pt_label: Whether to generate point labels from masks.
+            offset: Offset for point label generation.
+            pseudo_label: Whether to load pseudo labels.
+            preded_label: Whether to load predicted labels.
+            augment: Whether to apply data augmentation.
+            turn_num: Turn number for pseudo/predicted label subdirectories.
+            target_mix: Whether to apply target mixing (currently unused).
+            file_name: Subdirectory suffix for images folder.
+        """
+        assert mode in ["train", "test"], f"Mode must be 'train' or 'test', got '{mode}'"
+
+        # Set data directory based on mode
+        split_dir = "trainval" if mode == "train" else "test"
+        self.data_dir = osp.join(base_dir, split_dir)
+
+        # Store configuration
+        self.mode = mode
         self.base_size = base_size
         self.pt_label = pt_label
         self.offset = offset
-        self.pesudo_label = pseudo_label
+        self.pseudo_label = pseudo_label  # Fixed typo: was 'pesudo_label'
         self.preded_label = preded_label
-        self.aug = augment
+        self.augment = augment  # Fixed: was 'aug'
         self.turn_num = turn_num
         self.target_mix = target_mix
-        self.names = []
-        for filename in os.listdir(osp.join(self.data_dir, 'images' + file_name)):
-            if filename.endswith('png'):
+
+        # Load image filenames
+        self.names: List[str] = []
+        images_dir = osp.join(self.data_dir, f"images{file_name}")
+        for filename in os.listdir(images_dir):
+            if filename.endswith(".png"):
                 self.names.append(filename)
 
-        self.aug_transformer = Augment_transform(base_size, mode) if augment else Augment_transform(base_size, "test")
+        # Initialize augmentation transformer
+        aug_mode = mode if augment else "test"
+        self.aug_transformer = Augment_transform(base_size, aug_mode)
 
-    def __getitem__(self, i):
-        name = self.names[i]
+    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Get a sample from the dataset.
+
+        Args:
+            index: Index of the sample to retrieve.
+
+        Returns:
+            A tuple of (image, mask) tensors. Image is single channel [1, H, W].
+            Mask may contain multiple channels if pseudo/predicted labels are loaded.
+        """
+        name = self.names[index]
         img_path = osp.join(self.data_dir, "images", name)
-        pesudo_label_path = osp.join(self.data_dir, f'pixel_pseudo_label{self.turn_num}_', name)
-        preded_label_path = osp.join(self.data_dir, f'preded_label/{self.turn_num}', name)
+        pseudo_label_path = osp.join(
+            self.data_dir, f"pixel_pseudo_label{self.turn_num}_", name
+        )
+        preded_label_path = osp.join(
+            self.data_dir, f"preded_label/{self.turn_num}", name
+        )
         label_path = osp.join(self.data_dir, "masks", name)
 
-        img, mask= cv2.imread(img_path, 0), cv2.imread(label_path, 0)
-        img, mask= torch.from_numpy(img).unsqueeze(0).float(), torch.from_numpy(mask).unsqueeze(0).float()
-        
-        if self.pesudo_label:
-            pesudo_label = cv2.imread(pesudo_label_path, 0)
-            pesudo_label = torch.from_numpy(pesudo_label).unsqueeze(0).float()
-            pesudo_label = transforms.functional.resize(pesudo_label, (mask.shape[-2], mask.shape[-1]))
-            mask = torch.cat([mask, pesudo_label], dim=0)
+        # Load image and mask as single-channel tensors
+        img_np = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+        mask_np = cv2.imread(label_path, cv2.IMREAD_GRAYSCALE)
+        img = torch.from_numpy(img_np).unsqueeze(0).float()
+        mask = torch.from_numpy(mask_np).unsqueeze(0).float()
+
+        # Load and resize pseudo label if enabled
+        if self.pseudo_label:
+            pseudo_label_np = cv2.imread(pseudo_label_path, cv2.IMREAD_GRAYSCALE)
+            pseudo_label = torch.from_numpy(pseudo_label_np).unsqueeze(0).float()
+            # Resize pseudo label to match mask dimensions
+            pseudo_label = transforms.functional.resize(
+                pseudo_label, (mask.shape[-2], mask.shape[-1])
+            )
+            mask = torch.cat([mask, pseudo_label], dim=0)
+
+        # Load predicted label if enabled
         if self.preded_label:
-            preded_label = cv2.imread(preded_label_path, 0)
-            preded_label = torch.from_numpy(preded_label).unsqueeze(0).float()
+            preded_label_np = cv2.imread(preded_label_path, cv2.IMREAD_GRAYSCALE)
+            preded_label = torch.from_numpy(preded_label_np).unsqueeze(0).float()
             mask = torch.cat([mask, preded_label], dim=0)
-        
+
+        # Apply augmentation
         img, mask = self.aug_transformer(img, mask)
 
-        img, mask = img / 255.0, mask / 255.0
+        # Normalize to [0, 1]
+        img = img / PIXEL_NORMALIZATION_FACTOR
+        mask = mask / PIXEL_NORMALIZATION_FACTOR
 
+        # Convert mask to point label if enabled
         if self.pt_label:
             pt_label = mask2point(mask[0].unsqueeze(0), img, self.offset)
             mask[0] = pt_label
 
         return img, mask
-    
-    def __len__(self):
+
+    def __len__(self) -> int:
+        """Return the number of samples in the dataset."""
         return len(self.names)
 
 
-def __organize_dataset(training_dir, target_base_path):
+def __organize_dataset(training_dir: str, target_base_path: str) -> None:
+    """Organize dataset by separating images and masks.
+
+    Copies files ending with '_1' as images and '_2' as masks to separate
+    subdirectories, removing the suffix from filenames.
+
+    Args:
+        training_dir: Source directory containing mixed image/mask files.
+        target_base_path: Base directory for organized output.
     """
-    整理数据集：将 training_dir 中以 _1 结尾的文件作为 image，以 _2 结尾的文件作为 mask，分别复制到 target_base_path/image 和 target_base_path/mask。
-    """
-    training_path = training_dir
     image_target = osp.join(target_base_path, "image")
     mask_target = osp.join(target_base_path, "mask")
 
-    # 创建目标文件夹
-    if not os.path.exists(image_target):
-        os.makedirs(image_target)
-    if not os.path.exists(mask_target):
-        os.makedirs(mask_target)
+    # Create target directories
+    os.makedirs(image_target, exist_ok=True)
+    os.makedirs(mask_target, exist_ok=True)
 
-    # 遍历 training 文件夹中的所有文件
+    # Process all files in training directory
     for filename in os.listdir(training_dir):
-        file_path = os.path.join(training_dir, filename)
+        file_path = osp.join(training_dir, filename)
 
-        if not os.path.isfile(file_path):
-            continue  # 跳过子目录等非文件项
+        if not osp.isfile(file_path):
+            continue  # Skip non-file items
 
-        # 分离文件名和后缀
-        name, ext = os.path.splitext(filename)  # name 是不含后缀的文件名
+        # Split filename and extension
+        name, ext = osp.splitext(filename)
 
-        # 判断是否以 _1 或 _2 结尾
-        if name.endswith('_1'):
-            # 图像文件，去掉末尾 '_1'
-            new_name = name[:-2] + ext  # 去掉最后两个字符 '_1'
-            dest = os.path.join(image_target, new_name)
+        # Copy based on suffix pattern
+        if name.endswith("_1"):
+            # Image file: remove '_1' suffix
+            new_name = name[:-2] + ext
+            dest = osp.join(image_target, new_name)
             shutil.copy2(file_path, dest)
-            # print(f"🖼️  Copied image: {filename} -> {new_name} in 'image'")
 
-        elif name.endswith('_2'):
-            # 标签文件，去掉末尾 '_2'
-            new_name = name[:-2] + ext  # 去掉最后两个字符 '_2'
-            dest = os.path.join(mask_target, new_name)
+        elif name.endswith("_2"):
+            # Mask file: remove '_2' suffix
+            new_name = name[:-2] + ext
+            dest = osp.join(mask_target, new_name)
             shutil.copy2(file_path, dest)
-            # print(f"🟥 Copied mask:  {filename} -> {new_name} in 'mask'")
 
-        else:
-            continue  # 跳过不符合规则的文件
-
-    # print("✅ 数据集整理并重命名完成！")
 
 def __generate_and_save_point_labels(
     dataset_class: NUDTDataset,
